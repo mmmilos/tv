@@ -11,74 +11,138 @@ const PB = (() => {
   const vid = $('vid');
   const hasAV = () => typeof webapis !== 'undefined' && !!webapis && !!webapis.avplay;
   const A = () => webapis.avplay;
-  let mode = '', cb = {}, cur = 0, dur = 0, paused = false, tm = 0;
-  const ev = (n, a) => { if (cb[n]) cb[n](a); };
+  // Zusatz-Player (laufen über Media Source Extensions im normalen <video>-Element)
+  const LIBS = {
+    hls: ['https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js', 'https://unpkg.com/hls.js@1.5.15/dist/hls.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js', 'https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js'],
+    mpegts: ['https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js', 'https://unpkg.com/mpegts.js@1.7.3/dist/mpegts.js', 'https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.js']
+  };
+  const libP = {};
+  const libGet = n => (n === 'hls' ? window.Hls : window.mpegts);
+  function loadLib(n) {
+    if (libP[n]) return libP[n];
+    libP[n] = new Promise((res, rej) => {
+      if (libGet(n)) { res(libGet(n)); return; }
+      const urls = LIBS[n].slice();
+      const next = () => {
+        const u = urls.shift();
+        if (!u) { delete libP[n]; rej(new Error(n + '-Bibliothek nicht ladbar (Internet/CDN gesperrt?)')); return; }
+        const sc = document.createElement('script');
+        sc.src = u; sc.onload = () => { if (libGet(n)) res(libGet(n)); else next(); }; sc.onerror = next;
+        document.head.appendChild(sc);
+      };
+      next();
+    });
+    return libP[n];
+  }
+
+  let mode = '', cb = {}, cur = 0, dur = 0, paused = false, tm = 0, gen = 0, H = null, fire = () => {}, ready = () => {};
+  const msed = () => mode === 'html' || mode === 'hls' || mode === 'mpegts';
+  function safePlay() { try { const p = vid.play(); if (p && p.catch) p.catch(() => {}); } catch (e) { /* ignore */ } }
 
   function stop() {
-    clearInterval(tm);
+    gen++; clearInterval(tm);
     try { if (mode === 'av') { A().stop(); A().close(); } } catch (e) { /* ignore */ }
+    try {
+      if (H) {
+        if (mode === 'hls') H.destroy();
+        else { H.pause(); H.unload(); H.detachMediaElement(); H.destroy(); }
+      }
+    } catch (e) { /* ignore */ }
+    H = null;
     try { vid.pause(); vid.removeAttribute('src'); vid.load(); } catch (e) { /* ignore */ }
     mode = '';
   }
   vid.addEventListener('error', () => {
-    if (mode !== 'html') return;
+    if (!msed()) return;
     const c = vid.error ? vid.error.code : 0;
-    ev('err', 'HTML5-Fehler ' + c + (c === 4 ? ' (Format/Codec nicht unterstützt)' : ''));
+    fire('err', 'Video-Fehler ' + c + (c === 4 ? ' (Format/Codec nicht unterstützt)' : ''));
   });
-  vid.addEventListener('ended', () => { if (mode === 'html') ev('end'); });
-  vid.addEventListener('waiting', () => { if (mode === 'html') ev('buf', true); });
-  vid.addEventListener('playing', () => { if (mode === 'html') ev('buf', false); });
+  vid.addEventListener('ended', () => { if (msed()) fire('end'); });
+  vid.addEventListener('waiting', () => { if (msed()) fire('buf', true); });
+  vid.addEventListener('playing', () => { if (msed()) { fire('buf', false); ready(); } });
 
   function open(url, from, engine, callbacks) {
     stop();
+    const g = ++gen;
     cb = callbacks || {}; cur = 0; dur = 0; paused = false;
-    mode = engine === 'av' && hasAV() ? 'av' : 'html';
-    document.body.setAttribute('data-eng', mode);
+    let errored = false, readySent = false;
+    fire = (n, a) => {
+      if (g !== gen) return;
+      if (n === 'err') { if (errored) return; errored = true; }
+      if (cb[n]) cb[n](a);
+    };
+    ready = () => { if (!readySent && g === gen) { readySent = true; fire('ready'); } };
+    const f = fire;
+    mode = engine === 'av' && hasAV() ? 'av' : (engine === 'hls' || engine === 'mpegts' ? engine : 'html');
+    document.body.setAttribute('data-eng', mode === 'av' ? 'av' : 'html');
     tm = setInterval(() => {
       try {
         if (mode === 'av') cur = A().getCurrentTime() / 1000;
-        else if (mode === 'html') { cur = vid.currentTime || 0; dur = isFinite(vid.duration) ? vid.duration : 0; }
+        else if (msed()) { cur = vid.currentTime || 0; dur = isFinite(vid.duration) ? vid.duration : 0; }
       } catch (e) { /* Zustand noch nicht bereit */ }
     }, 400);
+
     if (mode === 'av') {
       try {
         const a = A();
         a.open(url);
         a.setDisplayRect(0, 0, window.innerWidth || 1920, window.innerHeight || 1080);
         a.setListener({
-          onbufferingstart: () => ev('buf', true),
-          onbufferingcomplete: () => ev('buf', false),
+          onbufferingstart: () => f('buf', true),
+          onbufferingcomplete: () => f('buf', false),
           oncurrentplaytime: ms => { cur = ms / 1000; },
-          onstreamcompleted: () => ev('end'),
-          onerror: e => ev('err', 'AVPlay-Fehler: ' + e),
-          onsubtitlechange: (d, t) => ev('sub', { d, t })
+          onstreamcompleted: () => f('end'),
+          onerror: e => f('err', 'AVPlay-Fehler: ' + e),
+          onsubtitlechange: (d, t) => f('sub', { d, t })
         });
         a.prepareAsync(() => {
           try {
             dur = a.getDuration() / 1000;
             if (from > 0) a.seekTo(Math.floor(from * 1000));
             a.play();
-          } catch (e) { ev('err', 'AVPlay play: ' + (e.message || e)); return; }
-          ev('ready');
-        }, e => ev('err', 'AVPlay prepare: ' + ((e && e.name) || e)));
-      } catch (e) { ev('err', 'AVPlay open: ' + (e.message || e)); }
+          } catch (e) { f('err', 'AVPlay play: ' + (e.message || e)); return; }
+          ready();
+        }, e => f('err', 'AVPlay prepare: ' + ((e && e.name) || e)));
+      } catch (e) { f('err', 'AVPlay open: ' + (e.message || e)); }
+    } else if (mode === 'hls') {
+      loadLib('hls').then(Hls => {
+        if (g !== gen) return;
+        if (!Hls.isSupported()) { f('err', 'hls.js: MSE hier nicht unterstützt'); return; }
+        let rec = false;
+        const h = new Hls({ enableWorker: false, maxBufferLength: 20, maxMaxBufferLength: 40, backBufferLength: 10, manifestLoadingTimeOut: 12000, levelLoadingTimeOut: 12000, fragLoadingTimeOut: 20000 });
+        H = h;
+        h.on(Hls.Events.ERROR, (e, d) => {
+          if (!d || !d.fatal) return;
+          if (d.type === Hls.ErrorTypes.MEDIA_ERROR && !rec) { rec = true; try { h.recoverMediaError(); return; } catch (x) { /* weiter */ } }
+          f('err', 'HLS ' + d.type + ': ' + d.details + (d.response && d.response.code ? ' (HTTP ' + d.response.code + ')' : ''));
+        });
+        h.on(Hls.Events.MANIFEST_PARSED, safePlay);
+        h.loadSource(url); h.attachMedia(vid);
+      }, e => f('err', e.message));
+    } else if (mode === 'mpegts') {
+      loadLib('mpegts').then(M => {
+        if (g !== gen) return;
+        if (!M.isSupported()) { f('err', 'mpegts.js: MSE hier nicht unterstützt'); return; }
+        const p = M.createPlayer({ type: 'mpegts', isLive: true, url: url }, { enableWorker: false, autoCleanupSourceBuffer: true });
+        H = p;
+        p.on(M.Events.ERROR, (t, d, info) => f('err', 'TS ' + t + ': ' + d + (info && info.code ? ' (' + info.code + ')' : '')));
+        p.attachMediaElement(vid); p.load(); safePlay();
+      }, e => f('err', e.message));
     } else {
       vid.src = url;
       const meta = () => {
         vid.removeEventListener('loadedmetadata', meta);
         if (from > 0) { try { vid.currentTime = from; } catch (e) { /* ignore */ } }
-        ev('ready');
       };
       vid.addEventListener('loadedmetadata', meta);
-      const pr = vid.play();
-      if (pr && pr.catch) pr.catch(() => {});
+      safePlay();
     }
   }
   function toggle() {
     try {
       if (mode === 'av') {
         if (A().getState() === 'PLAYING') { A().pause(); paused = true; } else { A().play(); paused = false; }
-      } else if (vid.paused) { vid.play(); paused = false; } else { vid.pause(); paused = true; }
+      } else if (vid.paused) { safePlay(); paused = false; } else { vid.pause(); paused = true; }
     } catch (e) { /* ignore */ }
     return paused;
   }
@@ -100,7 +164,10 @@ const PB = (() => {
           if (t.type === 'AUDIO') r.ca = t.index;
           if (t.type === 'TEXT') r.ct = t.index;
         });
-      } else {
+      } else if (mode === 'hls' && H && H.audioTracks && H.audioTracks.length > 1) {
+        H.audioTracks.forEach((t, i) => r.audio.push({ i, l: langName(t.lang) + (t.name && t.name !== t.lang ? ' – ' + t.name : '') }));
+        r.ca = H.audioTrack;
+      } else if (mode === 'html') {
         const at = vid.audioTracks;
         if (at && at.length > 1) {
           for (let i = 0; i < at.length; i++) { r.audio.push({ i, l: langName(at[i].language) + (at[i].label ? ' – ' + at[i].label : '') }); if (at[i].enabled) r.ca = i; }
@@ -112,6 +179,7 @@ const PB = (() => {
   function setAudio(i) {
     try {
       if (mode === 'av') A().setSelectTrack('AUDIO', i);
+      else if (mode === 'hls') H.audioTrack = i;
       else for (let k = 0; k < vid.audioTracks.length; k++) vid.audioTracks[k].enabled = k === i;
     } catch (e) { /* ignore */ }
   }
@@ -127,7 +195,7 @@ const PB = (() => {
 
 /* ================= Player-Oberfläche ================= */
 let np = null, backTo = 'home', lastSave = 0, ctlShown = false, ctlT = 0, ctlF = 0, pend = 0, pendBase = 0, pendT = 0;
-let menuOpen = false, menuItems = [], menuF = 0, pollT = 0, engine = 'av', subT = 0, busyT = 0;
+let menuOpen = false, menuItems = [], menuF = 0, pollT = 0, subT = 0, busyT = 0;
 
 const setBusy = (m, ms) => {
   $('busy').textContent = m || '';
@@ -136,13 +204,29 @@ const setBusy = (m, ms) => {
 };
 
 // o: {kind:'live'|'vod'|'ep', it, from, title, key, img, ser, list, idx, nextOpts}
+const ENGN = { av: 'AVPlay', hls: 'hls.js', mpegts: 'mpegts.js', html: 'HTML5' };
+// Reihenfolge der Abspiel-Versuche; was zuletzt funktioniert hat, kommt zuerst
+function planFor(o) {
+  const av = PB.hasAV(), pl = [];
+  if (o.kind !== 'live') {
+    if (av) pl.push({ e: 'av' });
+    pl.push({ e: 'html' });
+    return pl;
+  }
+  const fm = P.type === 'm3u' ? [/\.m3u8?(\?|$)/i.test(o.it.e) ? 'm3u8' : 'ts'] : ['m3u8', 'ts'];
+  if (av) fm.forEach(f => pl.push({ e: 'av', f }));
+  fm.forEach(f => pl.push({ e: f === 'm3u8' ? 'hls' : 'mpegts', f }));
+  fm.forEach(f => pl.push({ e: 'html', f }));
+  const pe = String(LS.get('pe', ''));
+  const i = pl.findIndex(x => x.e + '|' + (x.f || '') === pe);
+  if (i > 0) pl.unshift(pl.splice(i, 1)[0]);
+  return pl;
+}
 function openPlayer(o) {
-  o.formats = o.kind === 'live' && P.type === 'xtream' ? ['m3u8', 'ts'] : [null];
-  o.fi = 0; o.tried = {}; o.started = false;
+  o.plan = planFor(o); o.pi = 0; o.started = false; o.log = [];
   np = o;
   if (screen !== 'player') backTo = screen;
   show('player');
-  engine = PB.hasAV() ? LS.get('engine', 'av') : 'html';
   $('sub').textContent = '';
   ctlF = o.kind === 'live' ? 1 : 0;
   startStream(o.from || 0);
@@ -151,38 +235,34 @@ function openPlayer(o) {
 }
 function startStream(from) {
   const o = np; if (!o) return;
-  o.tried[engine] = 1; o.from = from;
-  const url = streamUrl(o.kind, o.it, o.formats[o.fi]);
+  const st = o.plan[o.pi]; o.from = from; o.started = false;
+  const url = streamUrl(o.kind, o.it, st.f || null);
   $('p-title').textContent = o.title;
-  setBusy('Lade …');
+  setBusy('Lade … (' + ENGN[st.e] + (st.f ? ' · ' + st.f : '') + ')');
   clearTimeout(o.wd);
   o.wd = setTimeout(() => { if (np === o && !o.started) onErr('Timeout – nach 15 s weder Bild noch Ton'); }, 15000);
-  PB.open(url, from, engine, {
-    ready: () => { if (np === o) { o.started = true; setBusy(''); clearTimeout(o.wd); } },
+  PB.open(url, from, st.e, {
+    ready: () => { if (np === o) { o.started = true; setBusy(''); clearTimeout(o.wd); LS.set('pe', st.e + '|' + (st.f || '')); } },
     err: m => { if (np === o) onErr(m); },
     end: () => { if (np === o) onEnd(); },
     buf: b => { if (np === o && o.started) setBusy(b ? 'Puffert …' : ''); },
     sub: onSub
   });
-  $('p-eng').textContent = 'Player: ' + (PB.mode() === 'av' ? 'AVPlay' : 'HTML5' + (PB.hasAV() ? '' : ' (AVPlay hier nicht verfügbar)')) + (o.formats[o.fi] ? ' · Format ' + o.formats[o.fi] : '');
+  $('p-eng').textContent = 'Player: ' + ENGN[st.e] + (st.f ? ' · ' + st.f : '') + ' (' + (o.pi + 1) + '/' + o.plan.length + ')' + (PB.hasAV() ? '' : ' · AVPlay nicht verfügbar');
 }
 function restartStream() {
   if (!np) return;
-  np.started = false; np.tried = {};
   startStream(np.kind === 'live' ? 0 : PB.time());
 }
 function onErr(msg) {
   const o = np; if (!o) return;
   clearTimeout(o.wd);
-  o.log = (o.log || []).concat((PB.mode() === 'av' ? 'AVPlay' : 'HTML5') + '/' + (o.formats[o.fi] || 'direkt') + ': ' + msg);
+  const st = o.plan[o.pi];
+  o.log.push(ENGN[st.e] + (st.f ? '/' + st.f : '') + ': ' + msg);
   if (o.started) { setBusy(msg, 4000); return; }
-  if (o.fi + 1 < o.formats.length) { o.fi++; setBusy('Versuche anderes Format …'); startStream(o.from || 0); return; }
-  const other = engine === 'av' ? 'html' : 'av';
-  if (!o.tried[other] && (other === 'html' || PB.hasAV())) {
-    engine = other; o.fi = 0; setBusy('Versuche anderen Player …'); startStream(o.from || 0); return;
-  }
+  if (o.pi + 1 < o.plan.length) { o.pi++; setBusy('Versuche nächste Variante …'); startStream(o.from || 0); return; }
   PB.stop();
-  setBusy('Wiedergabe nicht möglich\n' + o.log.slice(-4).join('\n') + '\n\nZurück-Taste: schließen · Menü „Quelle“: Format/Player wechseln');
+  setBusy('Wiedergabe nicht möglich\n' + o.log.slice(-5).join('\n') + '\n\nZurück: schließen · Menü „Quelle“: Variante wählen');
   showCtl();
 }
 function onEnd() {
@@ -292,7 +372,7 @@ function openMenu(kind) {
   if (kind === 'audio') {
     title = 'Tonspur';
     t.audio.forEach(a => menuItems.push({ l: a.l, on: a.i === t.ca, f: () => PB.setAudio(a.i) }));
-    if (!menuItems.length) note = PB.mode() === 'av' ? 'Dieser Stream hat nur eine Tonspur.' : 'Tonspur-Auswahl geht nur mit AVPlay (Menü „Quelle“).';
+    if (!menuItems.length) note = (PB.mode() === 'av' || PB.mode() === 'hls') ? 'Dieser Stream hat nur eine Tonspur.' : 'Tonspur-Auswahl gibt es nur mit AVPlay oder hls.js (Menü „Quelle“).';
   } else if (kind === 'sub') {
     title = 'Untertitel';
     if (t.text.length) {
@@ -301,9 +381,8 @@ function openMenu(kind) {
     } else note = PB.mode() === 'av' ? 'Dieser Stream hat keine eingebetteten Untertitel.' : 'Untertitel gehen nur mit AVPlay (Menü „Quelle“).';
   } else {
     title = 'Quelle & Wiedergabe';
-    if (np.formats.length > 1) np.formats.forEach((f, i) => menuItems.push({ l: 'Format: ' + f, on: i === np.fi, f: () => { np.fi = i; restartStream(); } }));
-    menuItems.push({ l: 'Player: AVPlay (Samsung)' + (PB.hasAV() ? '' : ' – nicht verfügbar'), on: engine === 'av', f: () => { if (PB.hasAV()) { engine = 'av'; LS.set('engine', 'av'); restartStream(); } } });
-    menuItems.push({ l: 'Player: HTML5', on: engine === 'html', f: () => { engine = 'html'; LS.set('engine', 'html'); restartStream(); } });
+    np.plan.forEach((st, i) => menuItems.push({ l: ENGN[st.e] + (st.f ? ' · ' + st.f : ''), on: i === np.pi, f: () => { np.pi = i; restartStream(); } }));
+    if (!PB.hasAV()) menuItems.push({ l: 'AVPlay (Samsung) ist hier nicht verfügbar', on: false, f: () => {} });
   }
   $('menu-t').textContent = title;
   const list = $('menu-list'); list.innerHTML = '';
