@@ -150,6 +150,13 @@ const PB = (() => {
     s = Math.max(0, dur > 3 ? Math.min(s, dur - 3) : s);
     try { if (mode === 'av') A().seekTo(Math.floor(s * 1000)); else vid.currentTime = s; cur = s; } catch (e) { /* ignore */ }
   }
+  const tl = (lang, label, i) => {
+    const p = [];
+    if (lang && String(lang).toLowerCase() !== 'und') p.push(langName(lang));
+    if (label && String(label).toLowerCase() !== String(lang || '').toLowerCase()) p.push(label);
+    return p.length ? p.join(' – ') : 'Spur ' + (i + 1);
+  };
+  // Es werden nur Spuren gelistet, die der aktive Player wirklich meldet
   function tracks() {
     const r = { audio: [], text: [], ca: -1, ct: -1 };
     try {
@@ -164,31 +171,54 @@ const PB = (() => {
           if (t.type === 'AUDIO') r.ca = t.index;
           if (t.type === 'TEXT') r.ct = t.index;
         });
-      } else if (mode === 'hls' && H && H.audioTracks && H.audioTracks.length > 1) {
-        H.audioTracks.forEach((t, i) => r.audio.push({ i, l: langName(t.lang) + (t.name && t.name !== t.lang ? ' – ' + t.name : '') }));
+      } else if (mode === 'hls' && H) {
+        (H.audioTracks || []).forEach((t, i) => r.audio.push({ i, l: tl(t.lang, t.name, i) }));
         r.ca = H.audioTrack;
+        (H.subtitleTracks || []).forEach((t, i) => r.text.push({ i, l: tl(t.lang, t.name, i) }));
+        r.ct = H.subtitleTrack;
       } else if (mode === 'html') {
         const at = vid.audioTracks;
-        if (at && at.length > 1) {
-          for (let i = 0; i < at.length; i++) { r.audio.push({ i, l: langName(at[i].language) + (at[i].label ? ' – ' + at[i].label : '') }); if (at[i].enabled) r.ca = i; }
+        if (at && at.length) {
+          for (let i = 0; i < at.length; i++) { r.audio.push({ i, l: tl(at[i].language, at[i].label, i) }); if (at[i].enabled) r.ca = i; }
+        }
+        const tt = vid.textTracks;
+        if (tt) {
+          for (let i = 0; i < tt.length; i++) {
+            if (tt[i].kind !== 'subtitles' && tt[i].kind !== 'captions') continue;
+            r.text.push({ i, l: tl(tt[i].language, tt[i].label, i) });
+            if (tt[i].mode === 'showing') r.ct = i;
+          }
         }
       }
     } catch (e) { /* ignore */ }
     return r;
   }
+  // true = Wechsel hat nachweislich geklappt, false = Player hat ihn nicht übernommen
   function setAudio(i) {
     try {
-      if (mode === 'av') A().setSelectTrack('AUDIO', i);
-      else if (mode === 'hls') H.audioTrack = i;
-      else for (let k = 0; k < vid.audioTracks.length; k++) vid.audioTracks[k].enabled = k === i;
-    } catch (e) { /* ignore */ }
+      if (mode === 'av') { A().setSelectTrack('AUDIO', i); return true; }
+      if (mode === 'hls') { H.audioTrack = i; return H.audioTrack === i; }
+      const at = vid.audioTracks;
+      if (!at || !at[i]) return false;
+      for (let k = 0; k < at.length; k++) at[k].enabled = k === i;
+      return at[i].enabled === true;
+    } catch (e) { return false; }
   }
   function setText(i) {
     try {
-      if (mode !== 'av') return;
-      if (i < 0) A().setSilentSubtitle(true);
-      else { A().setSelectTrack('TEXT', i); A().setSilentSubtitle(false); }
-    } catch (e) { /* ignore */ }
+      if (mode === 'av') {
+        if (i < 0) A().setSilentSubtitle(true);
+        else { A().setSelectTrack('TEXT', i); A().setSilentSubtitle(false); }
+        return true;
+      }
+      if (mode === 'hls') { H.subtitleTrack = i; H.subtitleDisplay = i >= 0; return H.subtitleTrack === i; }
+      const tt = vid.textTracks;
+      if (!tt) return false;
+      for (let k = 0; k < tt.length; k++) {
+        if (tt[k].kind === 'subtitles' || tt[k].kind === 'captions') tt[k].mode = k === i ? 'showing' : 'disabled';
+      }
+      return i < 0 || (!!tt[i] && tt[i].mode === 'showing');
+    } catch (e) { return false; }
   }
   return { hasAV, open, stop, toggle, seekTo, tracks, setAudio, setText, time: () => cur, dur: () => dur, paused: () => paused, mode: () => mode };
 })();
@@ -223,6 +253,7 @@ function planFor(o) {
   return pl;
 }
 function openPlayer(o) {
+  setOv('');
   o.plan = planFor(o); o.pi = 0; o.started = false; o.log = [];
   np = o;
   if (screen !== 'player') backTo = screen;
@@ -300,6 +331,49 @@ function poll() {
   if (t > (np.from || 0) + 0.5 && !np.started) { np.started = true; clearTimeout(np.wd); setBusy(''); }
   if (ctlShown) renderBar(t, d);
   if (np.kind !== 'live' && Date.now() - lastSave > 10000) savePos();
+  updateExtra();
+}
+
+/* ---- Nächste Folge & Intro überspringen ---- */
+// Xtream liefert keine Intro-Markierungen: der Button springt um eine feste Zeit (config.js: introSkip, Standard 90 s)
+const INTRO_SKIP = (window.CFG && +window.CFG.introSkip) || 90;
+let ovMode = '';
+const hasNext = () => !!(np && np.nextOpts && np.nextOpts());
+function introWin(t, d) { return !!np && np.kind === 'ep' && d > 600 && t >= 5 && t <= 240 && !np.introDone; }
+function nextWin(t, d) { return !!np && np.kind === 'ep' && d > 120 && d - t < 45 && d - t > 0 && hasNext(); }
+function setOv(m) {
+  if (m === ovMode) return;
+  ovMode = m;
+  const b = $('skipbtn');
+  b.textContent = m === 'next' ? '▶  Nächste Folge' : m === 'intro' ? '⏭  Intro überspringen' : '';
+  b.classList.toggle('on', !!m);
+}
+function updateExtra() {
+  if (!np) { setOv(''); return; }
+  const t = PB.time(), d = PB.dur();
+  if (t > 240) np.introDone = true;
+  const iw = introWin(t, d);
+  $('pb-next').style.display = hasNext() ? '' : 'none';
+  $('pb-skip').style.display = iw ? '' : 'none';
+  let m = '';
+  if (nextWin(t, d)) m = 'next';
+  else if (iw) { if (!np.introSince) np.introSince = Date.now(); if (Date.now() - np.introSince < 25000) m = 'intro'; }
+  setOv(menuOpen ? '' : m);
+  if (ctlShown) { const n = pbBtns().length; if (ctlF > n) ctlF = n; renderCtlFocus(); }
+}
+function doSkip() {
+  if (!np) return;
+  np.introDone = true;
+  PB.seekTo(PB.time() + INTRO_SKIP);
+  setOv('');
+  setBusy('Intro übersprungen', 1500);
+  updateExtra();
+}
+function goNext() {
+  const nx = np && np.nextOpts && np.nextOpts();
+  if (!nx) return;
+  savePos(); setOv('');
+  openPlayer(nx);
 }
 function closePlayer() {
   const o = np;
@@ -309,6 +383,7 @@ function closePlayer() {
   PB.stop();
   menuOpen = false; $('menu').classList.remove('on');
   $('sub').textContent = ''; setBusy('');
+  setOv('');
   hideCtl();
   show(backTo || 'home');
   afterPlayer();
@@ -333,7 +408,7 @@ function renderCtlFocus() {
 function showCtl() {
   ctlShown = true;
   $('ctl').classList.add('on'); $('p-top').classList.add('on');
-  renderBar(PB.time(), PB.dur()); renderCtlFocus();
+  renderBar(PB.time(), PB.dur()); updateExtra(); renderCtlFocus();
   clearTimeout(ctlT);
   if (!menuOpen) ctlT = setTimeout(hideCtl, 5000);
 }
@@ -362,27 +437,33 @@ function pbAction(a) {
   if (a === 'play') togglePlay();
   else if (a === 'back') seekBy(-10);
   else if (a === 'fwd') seekBy(10);
+  else if (a === 'next') goNext();
+  else if (a === 'skip') doSkip();
   else openMenu(a);
 }
 
 /* ---- Menü: Tonspur / Untertitel / Quelle ---- */
 function openMenu(kind) {
   menuItems = []; let title = '', note = '';
-  const t = PB.tracks();
+  const t = PB.tracks(), md = PB.mode();
+  const act = f => () => { const r = f(); setBusy(r === false ? 'Dieser Player hat die Umschaltung nicht übernommen' : '', 3500); };
   if (kind === 'audio') {
     title = 'Tonspur';
-    t.audio.forEach(a => menuItems.push({ l: a.l, on: a.i === t.ca, f: () => PB.setAudio(a.i) }));
-    if (!menuItems.length) note = (PB.mode() === 'av' || PB.mode() === 'hls') ? 'Dieser Stream hat nur eine Tonspur.' : 'Tonspur-Auswahl gibt es nur mit AVPlay oder hls.js (Menü „Quelle“).';
+    t.audio.forEach(a => menuItems.push({ l: a.l, on: a.i === t.ca, f: act(() => PB.setAudio(a.i)) }));
+    if (!menuItems.length) note = 'Der Player (' + ENGN[md] + ') meldet keine wählbaren Tonspuren. Entweder hat der Stream nur eine, oder dieser Player kann sie nicht auslesen.';
+    else if (menuItems.length === 1) note = 'Es wird nur diese eine Tonspur gemeldet.';
+    else if (md === 'html') note = 'Vom Browser gemeldet. Das Umschalten wird geprüft, klappt aber nicht bei jedem Format.';
   } else if (kind === 'sub') {
     title = 'Untertitel';
     if (t.text.length) {
-      menuItems.push({ l: 'Aus', on: t.ct < 0, f: () => PB.setText(-1) });
-      t.text.forEach(a => menuItems.push({ l: a.l, on: a.i === t.ct, f: () => PB.setText(a.i) }));
-    } else note = PB.mode() === 'av' ? 'Dieser Stream hat keine eingebetteten Untertitel.' : 'Untertitel gehen nur mit AVPlay (Menü „Quelle“).';
+      menuItems.push({ l: 'Aus', on: t.ct < 0, f: act(() => PB.setText(-1)) });
+      t.text.forEach(a => menuItems.push({ l: a.l, on: a.i === t.ct, f: act(() => PB.setText(a.i)) }));
+      if (md === 'html') note = 'Vom Browser gemeldet. Das Umschalten wird geprüft.';
+    } else note = 'Der Player (' + ENGN[md] + ') meldet keine Untertitel. Eingebettete Untertitel in Dateien kann der Browser-Player meist nicht auslesen, dafür bräuchte es AVPlay.';
   } else {
     title = 'Quelle & Wiedergabe';
     np.plan.forEach((st, i) => menuItems.push({ l: ENGN[st.e] + (st.f ? ' · ' + st.f : ''), on: i === np.pi, f: () => { np.pi = i; restartStream(); } }));
-    if (!PB.hasAV()) menuItems.push({ l: 'AVPlay (Samsung) ist hier nicht verfügbar', on: false, f: () => {} });
+    note = 'tizen-API: ' + (typeof tizen !== 'undefined' ? 'ja' : 'nein') + ' · AVPlay: ' + (PB.hasAV() ? 'ja' : 'nein');
   }
   $('menu-t').textContent = title;
   const list = $('menu-list'); list.innerHTML = '';
@@ -411,9 +492,10 @@ function playerKey(e, k, d) {
   if (back || k === 413) { e.preventDefault(); closePlayer(); return; }
   if (k === 415 || k === 19 || k === 10252) { e.preventDefault(); togglePlay(); return; }
   if (k === 417 || k === 412) { e.preventDefault(); seekBy(k === 417 ? 30 : -30); showCtl(); return; }
-  if (k === 427 || k === 428) { e.preventDefault(); if (live) zap(k === 427 ? 1 : -1); return; }
+  if (k === 427 || k === 428) { e.preventDefault(); if (live) zap(k === 427 ? 1 : -1); else if (k === 427) goNext(); return; }
   if (!d && k !== 13) return;
   e.preventDefault();
+  if (!ctlShown && ovMode && k === 13) { if (ovMode === 'next') goNext(); else doSkip(); return; }
   if (!ctlShown) {
     if (k === 13) { togglePlay(); showCtl(); return; }
     if (live && d[1]) { zap(d[1]); return; }

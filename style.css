@@ -148,3 +148,6 @@ body[data-eng=html] #av { display:none; }
 .mn { color:var(--mut); font-size:20px; line-height:28px; padding:6px 4px; }
 
 #boot { display:none; position:fixed; top:0; left:0; right:0; z-index:99; padding:12px 24px; background:#5a1010; color:#fff; font-size:20px; line-height:26px; }
+
+#skipbtn { display:none; position:absolute; right:60px; bottom:210px; padding:16px 34px; border-radius:8px; background:#fff; color:#000; font-size:26px; font-weight:bold; z-index:6; border:4px solid #fff; }
+#skipbtn.on { display:block; }

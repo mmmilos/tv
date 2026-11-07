@@ -206,8 +206,23 @@ function playLive(list, i) {
   const it = list[i]; if (!it) return;
   openPlayer({ kind: 'live', it, title: it.n, key: it.k, img: it.i, list, idx: i });
 }
+function flatFrom(series, inf) {
+  const eps = inf.eps || {}, flat = [];
+  Object.keys(eps).filter(s => Array.isArray(eps[s]) && eps[s].length).sort((x, y) => x - y)
+    .forEach(s => eps[s].forEach(e => flat.push({ s, ep: mkEp(series, s, e) })));
+  return flat;
+}
 function resumeCont(k, v) {
-  openPlayer({ kind: v.kind, it: v.it, from: v.t, title: v.n, key: k, img: v.i, ser: v.ser });
+  const o = { kind: v.kind, it: v.it, from: v.t, title: v.n, key: k, img: v.i, ser: v.ser };
+  openPlayer(o);
+  if (v.kind === 'ep' && v.ser) {                      // Folgen-Liste nachladen, damit „Nächste Folge“ geht
+    libInfo(v.ser, 'series').then(inf => {
+      if (np !== o || !inf || !inf.eps) return;
+      const ctx = { item: v.ser, flat: flatFrom(v.ser, inf) };
+      const i = ctx.flat.findIndex(f => f.ep.k === k);
+      if (i >= 0) o.nextOpts = () => (i + 1 < ctx.flat.length ? epOpts(ctx, i + 1, 0) : null);
+    });
+  }
 }
 function mkEp(series, s, e) {
   return {
