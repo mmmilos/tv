@@ -266,6 +266,16 @@ function setupSeries(ctx, inf) {
 async function loadVersions(ctx, my) {
   const it = ctx.item, tmdb = ctx.src === 'tmdb', t = ctx.t;
   try {
+    if (tmdb && P.type === 'xtream' && !await DB.getMeta(`${P.id}|${t}|indexed`)) {
+      let last = 0;
+      ctx.idxMsg = `Erstmalige Indexierung der Playlist (${TLABEL[t]}) … einmalig, kann etwas dauern`;
+      refreshDet(ctx);
+      await indexType(P, t, (i, n) => {
+        if (my !== dtok || Date.now() - last < 1500) return;
+        last = Date.now(); ctx.idxMsg = `Indexiere ${TLABEL[t]}: Kategorie ${i}/${n} …`; refreshDet(ctx);
+      });
+      if (my !== dtok) return;
+    }
     const res = await findMatches(`${P.id}|${t}`, tmdb ? [it.n, it.on] : [it.n], tmdb ? it.y : yearOf(it.n), () => my !== dtok);
     if (my !== dtok) return;
     const names = await catNames(P, t), pre = `${P.id}|${t}|`;
@@ -276,7 +286,7 @@ async function loadVersions(ctx, my) {
       return { l: r.n, sub: [isCur ? 'aktuell' : '', cat, tags].filter(Boolean).join(' · '), act: 'open', ref: r, t, cur: isCur };
     });
   } catch (e) { ctx.vers = []; }
-  ctx.searching = false;
+  ctx.searching = false; ctx.idxMsg = '';
   refreshDet(ctx);
 }
 function epItems(ctx) {
@@ -311,7 +321,7 @@ function buildDetRows(ctx) {
   if (ctx.src === 'tmdb') {
     rows.push({
       id: 'vers', kind: 'wide', title: 'In deiner Playlist verfügbar',
-      items: ctx.searching ? [{ l: 'Suche …', act: 'none' }]
+      items: ctx.searching ? [{ l: ctx.idxMsg || 'Suche …', act: 'none' }]
         : ctx.vers.length ? ctx.vers
           : [{ l: 'Keine Treffer', sub: 'Tipp: Playlists → „Index“ (durchsucht alle Kategorien)', act: 'none' }]
     });
@@ -449,7 +459,7 @@ async function runSearch() {
     const r = await DB.scan(`${P.id}|${T}`, q, 500, () => my !== tok, it => !hd[it.ck.slice(pre.length)]);
     if (my !== tok) return;
     GRID.setItems(r);
-    const full = P.type === 'm3u' || await DB.getMeta(P.id + '|indexed');
+    const full = P.type === 'm3u' || await DB.getMeta(`${P.id}|${T}|indexed`);
     setStatus(`${r.length}${r.length >= 500 ? '+' : ''} Treffer` + (full ? '' : ' – nur bereits geladene Kategorien (Playlists → Index)'));
   } catch (e) { setStatus('Suchfehler: ' + e.message); }
 }

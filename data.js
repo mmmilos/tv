@@ -158,16 +158,35 @@ const Src = {
   }
 };
 
-async function indexAll(p) {
-  if (p.type === 'm3u') { await Src.cats(p, 'live'); setStatus('M3U ist bereits vollständig geladen.'); return; }
-  for (const t of ['live', 'vod', 'series']) {
+const idxJobs = {}, idxProg = {};
+const TLABEL = { live: 'Live', vod: 'Filme', series: 'Serien' };
+// Lädt alle Kategorien eines Typs einmalig in die Datenbank (danach findet die Suche alles). 4 Kategorien parallel.
+function indexType(p, t, prog) {
+  const k = `${p.id}|${t}`;
+  if (idxJobs[k]) return idxJobs[k];
+  idxJobs[k] = (async () => {
+    if (p.type === 'm3u') { await Src.cats(p, 'live'); return; }
+    if (await DB.getMeta(k + '|indexed')) return;
     const cs = await Src.cats(p, t);
-    for (let i = 0; i < cs.length; i++) {
-      setStatus(`Index ${{ live: 'Live', vod: 'Filme', series: 'Serien' }[t]}: Kategorie ${i + 1}/${cs.length} …`);
-      try { await Src.items(p, t, cs[i].id); } catch (e) { /* einzelne Kategorie ueberspringen */ }
-    }
-  }
-  await DB.setMeta(p.id + '|indexed', 1);
+    let bad = 0, done = 0, next = 0;
+    idxProg[k] = { i: 0, n: cs.length };
+    const work = async () => {
+      while (next < cs.length) {
+        const c = cs[next++];
+        try { await Src.items(p, t, c.id); } catch (e) { bad++; }
+        done++; idxProg[k].i = done;
+        if (prog) prog(done, cs.length);
+      }
+    };
+    await Promise.all([work(), work(), work(), work()]);
+    if (cs.length && bad > cs.length / 2) throw new Error('Server nicht erreichbar');
+    await DB.setMeta(k + '|indexed', 1);
+  })().then(r => { delete idxJobs[k]; delete idxProg[k]; return r; }, e => { delete idxJobs[k]; delete idxProg[k]; throw e; });
+  return idxJobs[k];
+}
+async function indexAll(p) {
+  if (p.type === 'm3u') { await indexType(p, 'live'); setStatus('M3U ist bereits vollständig geladen.'); return; }
+  for (const t of ['live', 'vod', 'series']) await indexType(p, t, (i, n) => setStatus(`Index ${TLABEL[t]}: Kategorie ${i}/${n} …`));
   setStatus('Index fertig – Suche findet jetzt alles.');
 }
 

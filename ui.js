@@ -83,6 +83,7 @@ const mk = (cls, txt) => {
 function norm(s) {
   s = String(s || '').toLowerCase();
   try { s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (e) { /* alt */ }
+  s = s.replace(/^\s*(\[[a-z]{2,3}\]|\|[a-z]{2,3}\||\([a-z]{2,3}\)|(?:de|at|ch|en|us|uk|fr|it|es|tr|nl|pl|ru|pt|ar|ex)\s*[:|\-\u2013])\s*/, '');   // Länderpräfix wie [DE] | DE: |DE|
   return s.replace(/\[[^\]]*\]|\([^)]*\)/g, ' ')
     .replace(/\b(4k|uhd|fhd|hd|sd|hdr|hevc|x265|1080p|720p|2160p|bluray|german|deutsch|dubbed|multi|ac3)\b/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ').trim();
